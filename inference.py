@@ -7,13 +7,16 @@ from accelerate.utils import gather_object
 import argparse
 from tqdm import tqdm
 from datasets import load_dataset, load_from_disk
+import pickle
+import os
+import torch.nn.functional as F
 
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--output_path", type=str)
+    parser.add_argument("--output_path", type=str, default='.')
     args = parser.parse_args()
     return args
 
@@ -69,12 +72,18 @@ if __name__ == "__main__":
         for batch in tqdm(batched_prompts):
             # Move the batch to the device
             batch = batch.to(distributed_state.device)
-            batch['labels'] = batch['input_ids']
+            # batch['labels'] = batch['input_ids']
             # We generate the text, decode it and add it to the list completions_per_process
             #outputs = model.generate(**batch, max_new_tokens=2048)
+            bs, seq_len = batch['input_ids'].shape
             with torch.no_grad():
                 outputs = model.forward(**batch)
-                completions_per_process.append(outputs.loss.cpu().item())
+                shift_logits = outputs.logits.view(-1, model.config.vocab_size)
+                shift_labels = batch['input_ids'].view(-1)
+                loss = F.cross_entropy(shift_logits, shift_labels, reduction='none')
+                loss = loss.reshape(bs, seq_len) 
+                loss = loss.mean(dim=1) # bs
+                completions_per_process.extend(loss.cpu().tolist())
 
     # We are gathering string, so we need to use gather_object.
     # If you need to gather tensors, you can use gather from accelerate.utils
@@ -82,7 +91,5 @@ if __name__ == "__main__":
 
     # Drop duplicates produced by apply_padding in split_between_processes
     completions = completions_gather[: len(data)]
-    value = sum(completions) / len(completions)
-    distributed_state.print(completions)
-    with open(args.output_path, 'w') as f:
-        f.write('loss: ' + str(value))
+    with open(os.path.join(args.output_path, 'loss.pkl'), 'wb') as f:
+        pickle.dump(completions, f)
